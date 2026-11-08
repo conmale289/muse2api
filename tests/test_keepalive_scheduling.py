@@ -36,6 +36,11 @@ def test_keepalive_only_runs_when_due():
     now = 1_900_000_000
     original_store, original_cfg = app.store, app.CFG
     class FakeStore:
+        # The real store collapses a sweep's account writes into one flush.
+        def batch_writes(self):
+            import contextlib
+            return contextlib.nullcontext()
+
         def list_accounts(self):
             return [
                 {"id": "fresh", "label": "fresh", "enabled": True,

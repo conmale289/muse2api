@@ -6,12 +6,13 @@ from urllib.parse import urlsplit
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from cdp import CDP
+from _browser import chromium_path
 parser=argparse.ArgumentParser();parser.add_argument('--html',default=str(ROOT/'admin.html'));parser.add_argument('--screenshots',type=Path);parser.add_argument('--probe-only',action='store_true');args=parser.parse_args()
 html=Path(args.html).read_bytes()
 VERSION=json.loads((ROOT/'version.json').read_text())['version']
 now=int(time.time())
 accounts=[{'id':'fixture'+str(i).zfill(5),'label':'Fixture-'+str(i),'enabled':True,'ok':True,'essential_ok':True,'cookie_count':12,
- 'proxy':None,'note':'会话有效 · 自动保活 (VM: RUNNING)','last_used':now-43200,'expires_at':now+172800,
+ 'proxy':None,'note':'Session valid · auto-keepalive (VM: RUNNING)','last_used':now-43200,'expires_at':now+172800,
  'quota':{'found':True,'plan':'Free plan','weekly_used_pct':29,'extra_left':'1B tokens left','checked_at':now-10000}} for i in range(8)]
 events=[]
 class Handler(BaseHTTPRequestHandler):
@@ -35,7 +36,7 @@ server=ThreadingHTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=serv
 with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
 with tempfile.TemporaryDirectory(prefix='muse-layout-',dir=Path.home()) as home:
  log=open(Path(home)/'chrome.log','wb')
- proc=subprocess.Popen([shutil.which('chromium') or shutil.which('google-chrome'),'--headless=new','--no-sandbox','--disable-dev-shm-usage','--remote-allow-origins=*',
+ proc=subprocess.Popen([chromium_path(),'--headless=new','--no-sandbox','--disable-dev-shm-usage','--remote-allow-origins=*',
  '--remote-debugging-port='+str(port),'--user-data-dir='+str(Path(home)/'browser'),'about:blank'],stdout=log,stderr=log,start_new_session=True)
  page=None
  try:

@@ -74,8 +74,8 @@ with tempfile.TemporaryDirectory() as home:
     assert norm(data_url("audio/mp3", MP3))[1] == "audio/mpeg"
     assert norm(data_url("", PDF))[1] == "application/pdf"
     assert norm(base64.b64encode(mp4(3)).decode())[1] == "video/mp4"
-    expect_error(lambda: norm(data_url("text/plain", b"x")), app.MuseGenerationError, "不受支持")
-    expect_error(lambda: norm(data_url("video/mp4", mp4(130))), app.MuseGenerationError, "120 秒")
+    expect_error(lambda: norm(data_url("text/plain", b"x")), app.MuseGenerationError, "not supported")
+    expect_error(lambda: norm(data_url("video/mp4", mp4(130))), app.MuseGenerationError, "120s")
     print("PASS: sniffing, MIME aliases, unsupported types and video duration limit")
 
     req = app.VideoRequest(prompt="x", images=["img"], videos=[{"video_url": "vid"}],
@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as home:
     expect_error(lambda: app._video_references(app.VideoRequest(prompt="x", videos=[{}])),
                  app.HTTPException, "videos[0]")
     expect_error(lambda: app._video_references(app.VideoRequest(
-        prompt="x", images=["a"] * 6, videos=["b"] * 5)), app.HTTPException, "最多 10 个")
+        prompt="x", images=["a"] * 6, videos=["b"] * 5)), app.HTTPException, "At most 10")
 
     prepared = app._prepare_reference_images([
         data_url("image/png", b"png"), data_url("video/mp4", mp4(4)), data_url("audio/wav", WAV)])
@@ -161,7 +161,7 @@ with tempfile.TemporaryDirectory() as home:
     print("PASS: multipart image/video/audio fields")
 
 
-    # 页面把刚上传的素材渲染成"结果"时，按哈希忽略并继续等待真正的成品
+    # When the page renders a just-uploaded asset as a "result", ignore it by hash and keep waiting for the real output
     media = Path(home, "media")
     guard = app.MuseEngine(SimpleNamespace(profile_dir=home, media_dir=str(media)))
     upload_bytes, result_bytes = mp4(4), mp4(5) + b"generated"

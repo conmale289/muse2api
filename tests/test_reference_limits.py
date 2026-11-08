@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory() as home:
     try:
         engine._attach_images([valid] * (app.MAX_REFERENCE_IMAGES + 1))
     except app.MuseGenerationError as exc:
-        assert f"最多 {app.MAX_REFERENCE_IMAGES} 个" in str(exc)
+        assert f"At most {app.MAX_REFERENCE_IMAGES} reference assets" in str(exc)
     else:
         raise AssertionError("more references than the limit were accepted")
 
@@ -140,8 +140,8 @@ async def expect_endpoint_400(request, text):
 # Exercise the real endpoint path, not only its helper.
 for body, text in [
     ({"prompt": "x", "async": True, "images": [None]}, "images[0]"),
-    ({"prompt": "x", "async": True, "images": ["new"], "image": "old"}, "不能"),
-    ({"prompt": "x", "async": True, "images": "not-an-array"}, "必须是数组"),
+    ({"prompt": "x", "async": True, "images": ["new"], "image": "old"}, "cannot"),
+    ({"prompt": "x", "async": True, "images": "not-an-array"}, "must be an array"),
 ]:
     asyncio.run(expect_endpoint_400(FakeJSONRequest(body), text))
 
@@ -174,6 +174,6 @@ asyncio.run(expect_endpoint_400(total_request, f"{app.MAX_REFERENCE_TOTAL_BYTES 
 
 count_request = FakeMultipartRequest(FakeForm(
     ["x"] * (app.MAX_REFERENCE_IMAGES + 1), prompt="x"))
-asyncio.run(expect_endpoint_400(count_request, f"最多 {app.MAX_REFERENCE_IMAGES} 个"))
+asyncio.run(expect_endpoint_400(count_request, f"At most {app.MAX_REFERENCE_IMAGES} reference assets"))
 
 print("PASS: endpoint JSON conflicts plus multipart count, per-file and total byte limits")

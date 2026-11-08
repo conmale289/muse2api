@@ -100,30 +100,64 @@ async def check(source, home):
         return {"filename": media.name, "size": media.stat().st_size,
                 "kind": "image", "path": str(media)}, "fixture-account"
 
-    locked_impl = module._run_generation_locked if hasattr(module, "_run_generation_locked") else None
-    if locked_impl:
-        def assert_owned(*args, **kwargs):
-            assert module.GEN_LOCK.locked(), "browser lock must cover retry/cleanup"
-            assert kwargs.get("deadline") is not None
-            return {"fixture": True}, None
-        module._run_generation_locked = assert_owned
-        module._run_generation("lock fixture", "image", 1)
-        module._run_generation_locked = locked_impl
-        assert not module.GEN_LOCK.locked()
+    # Lock contract: the account lease is taken first and the browser slot second, so
+    # GEN_LOCK now covers the attempt rather than the whole retry loop (see
+    # _run_generation). Assert what still matters: engine.generate runs under GEN_LOCK,
+    # the lock is released afterwards, and a busy browser fails fast.
+    class PoolStub:
+        def acquire(self, **kwargs):
+            return {"id": "acc-1", "label": "stub", "cookies": {}, "cookies_exp": {}}
+
+        def release(self, account_id):
+            pass
+
+    seen = {}
+    real_generate, real_start, real_pool = (module.engine.generate, module.engine.start,
+                                            module.ACCOUNT_POOL)
+    real_renew, real_sync = module._renew_and_persist, module._sync_cookies
+
+    def generate_probe(*args, **kwargs):
+        seen["locked"] = module.GEN_LOCK.locked()
+        return {"filename": media.name, "size": media.stat().st_size,
+                "kind": "image", "path": str(media)}, "acc-1"
+
+    module.ACCOUNT_POOL = PoolStub()
+    module.engine.start = lambda: None
+    module._renew_and_persist = lambda *a, **k: None
+    module._sync_cookies = lambda *a, **k: None
+    try:
+        module.engine.generate = generate_probe
+        module._run_generation("lock fixture", "image", 5)
+        assert seen.get("locked") is True, "engine.generate must run under GEN_LOCK"
+        assert not module.GEN_LOCK.locked(), "GEN_LOCK must be released afterwards"
+
         real_lock = module.GEN_LOCK
+
         class BusyLock:
-            def acquire(self, timeout):
-                assert timeout == 1
+            def acquire(self, timeout=None, blocking=True):
                 return False
+
+            def release(self):
+                raise AssertionError("release() without a successful acquire()")
+
+            def locked(self):
+                return True
+
         module.GEN_LOCK = BusyLock()
         try:
             module._run_generation("queue fixture", "image", 1)
-            raise AssertionError("busy browser must time out")
+            raise AssertionError("a busy browser must fail instead of blocking")
         except module.MuseGenerationError:
             pass
         finally:
             module.GEN_LOCK = real_lock
-        print("generation_lock_covers_retry_cleanup=PASS queue_wait_bounded=PASS")
+        print("generation_lock_covers_attempt=PASS queue_wait_bounded=PASS")
+    finally:
+        module.engine.generate = real_generate
+        module.engine.start = real_start
+        module.ACCOUNT_POOL = real_pool
+        module._renew_and_persist = real_renew
+        module._sync_cookies = real_sync
     module._run_generation = generation
     headers = {"Authorization": "Bearer test-only"}
     async with Client(module.app, headers) as client:

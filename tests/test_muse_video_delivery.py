@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory() as profile:
     try:
         engine._wait_attachment("", 60, "video")
     except engine_module.MuseGenerationError as exc:
-        assert "未成功送达" in str(exc)
+        assert "not delivered" in str(exc)
         assert clock[0] < 32, clock[0]
     else:
         raise AssertionError("undelivered video request waited for the full timeout")
@@ -102,7 +102,7 @@ try:
         {"stop": False, "tail": "", "path": "/thread/new"},
     ])
 except engine_module.MuseGenerationError as exc:
-    assert "未建立视频任务线程" in str(exc), str(exc)
+    assert "did not establish a video task thread" in str(exc), str(exc)
 else:
     raise AssertionError("idle /thread/new task waited for full timeout")
 

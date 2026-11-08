@@ -15,6 +15,8 @@ import time
 from types import SimpleNamespace
 import requests
 
+from _browser import chromium_path
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
 parser.add_argument("--probe-only", action="store_true")
@@ -39,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="muse-upload-check-", dir=Path.home()) a
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     log = open(Path(home) / "chromium.log", "wb")
-    proc = subprocess.Popen([shutil.which("chromium") or shutil.which("google-chrome"),
+    proc = subprocess.Popen([chromium_path(),
                              "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
                              "--remote-allow-origins=*", "--remote-debugging-port=" + str(port),
                              "--user-data-dir=" + str(Path(home) / "browser"), "about:blank"],

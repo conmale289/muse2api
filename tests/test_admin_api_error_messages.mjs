@@ -2,7 +2,7 @@
  * Run: node tests/test_admin_api_error_messages.mjs
  *
  * Behavioral test for the admin.html fetch helper (api()):
- * non-JSON error responses must surface a clear Chinese HTTP-status hint,
+ * non-JSON error responses must surface a clear HTTP-status hint,
  * never raw HTML source; JSON detail/message/error handling and success
  * passthrough must stay unchanged. No external dependencies.
  */

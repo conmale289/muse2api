@@ -14,8 +14,8 @@ from types import SimpleNamespace
 with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ignore_cleanup_errors=True) as tmp:
  with socket.socket() as sock:
   sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
- chromium=os.environ.get('MUSE2API_CHROMIUM') or next((shutil.which(n) for n in ('chromium','chromium-browser','google-chrome') if shutil.which(n)),None)
- if not chromium: raise SystemExit('Chromium required; set MUSE2API_CHROMIUM to its executable.')
+ from _browser import chromium_path
+ chromium=chromium_path()
  cfg=SimpleNamespace(chromium=chromium,cdp_port=port,home_dir=str(Path.home()),extra_path='',profile_dir=tmp+'/profile',data_dir=tmp,download_dir=tmp+'/downloads')
  Path(cfg.download_dir).mkdir()
  engine=module.MuseEngine(cfg)
@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ign
   video=engine._wait_attachment('',3,'video')
   engine.attachments=lambda:[{'src':'poster_only.png','tid':'image','hasVideo':False,'w':32,'h':32}]
   fallback_video_rejected=engine._wait_attachment('',1,'video') is None
-  # tid 已标 presentation-video，但尚无 <video>/vSrc：封面静帧不得当作命中
+  # tid is marked presentation-video, but there is no <video>/vSrc yet: a cover still must not count as a hit
   engine.attachments=lambda:[{'src':'cover.jpg','vSrc':'','tid':'hatch-chat-attachment-presentation-video','hasVideo':False,'w':1280,'h':720}]
   tid_video_cover_rejected=engine._wait_attachment('',1,'video') is None
   page.js('''document.body.innerHTML='<button aria-label="Download" onclick="window.wrongDownload=true">Download</button>';window.wrongDownload=false;''')
