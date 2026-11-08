@@ -1,9 +1,9 @@
-/* Muse2API Cookie 导入 —— 读取 muse.ai 的 cookie 并 POST 到 muse2api 服务。
+/* Muse2API Cookie Import — reads muse.ai cookies and POSTs them to the muse2api service.
  *
- * 关键点：用 chrome.cookies 而不是 document.cookie。
- * muse.ai 的关键会话 cookie（hatch_sess / hatch_vml）带 httpOnly，
- * 网页 JS 读不到，只有浏览器扩展的 cookies 接口能拿到。
- * hatch_gw 是可重新签发的路由缓存，不应阻止账号导入。
+ * Key point: use chrome.cookies, not document.cookie.
+ * muse.ai's key session cookies (hatch_sess / hatch_vml) are httpOnly,
+ * so page JS cannot read them; only the browser extension's cookies API can.
+ * hatch_gw is a re-issuable routing cache and must not block account import.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -11,22 +11,22 @@ const STORE = 'muse2api_ext_cfg';
 
 const ESSENTIAL = ['hatch_sess'];
 
-/* ================= 界面语言 / UI language =================
- * 中文是源语言；英文通过下面的词典替换。
- * 新增中文文案时，请在 I18N_EN（整句，可含 {name} 占位符）或 I18N_EN_PATTERNS（服务端返回的含变量文案）里补上英文。 */
+/* ================= UI language =================
+ * Chinese is the source language; English is substituted by the dictionaries below.
+ * When adding Chinese copy, add English to I18N_EN (whole sentences; may contain {name}) or I18N_EN_PATTERNS (server messages with variables). */
 const LANG_STORE = 'muse2api_lang';
 const LANG = (() => {
   try { const v = localStorage.getItem(LANG_STORE); if (v === 'zh' || v === 'en') return v; } catch (e) {}
-  return /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
+  return 'en';
 })();
 function setLang(v) {
   try { localStorage.setItem(LANG_STORE, v); } catch (e) {}
   location.reload();
 }
 
-/* 整句：中文 → 英文 */
+/* Whole sentences: Chinese -> English */
 const I18N_EN = {
-  // popup.html 静态文案
+  // popup.html static copy
   'Muse2API Cookie 导入': 'Muse2API Cookie Import',
   '把当前浏览器里 muse.ai 的登录态，一键同步到你的 muse2api 服务。':
     'Sync the muse.ai login session from this browser to your muse2api service in one click.',
@@ -34,8 +34,10 @@ const I18N_EN = {
   '账号标签（可留空）': 'Account label (optional)',
   '例如 muse-main': 'e.g. muse-main',
   '读取并导入': 'Read and import',
-  // popup.js 日志 / 状态
+  // popup.js logs / status
   '请先填服务地址': 'Please enter the service URL first',
+  '需要授权访问 {base} 才能导入。请再点一次，并在弹窗中选择允许。':
+    'Access to {base} must be granted before importing. Click again and choose Allow.',
   '请先填 API Key': 'Please enter the API Key first',
   '正在读取 muse.ai 的 Cookie…': 'Reading muse.ai cookies…',
   '没读到 muse.ai 的 Cookie。\n请先在这个浏览器里打开并登录 https://muse.ai/ ，再回来点一次。':
@@ -53,13 +55,13 @@ const I18N_EN = {
   '\n注意：{warning}': '\nNote: {warning}',
   '出错了：{msg}\n\n常见原因：\n· 服务地址填错或服务没启动\n· 这个地址不是 https（或证书不被信任）\n· 浏览器拦截了跨域请求':
     'Something went wrong: {msg}\n\nCommon causes:\n· The service URL is wrong or the service is not running\n· The URL is not https (or the certificate is not trusted)\n· The browser blocked the cross-origin request',
-  // 服务端（/admin/accounts）可能返回的整句
+  // Whole sentences the server (/admin/accounts) may return
   '未解析到任何 cookie，请检查格式': 'No cookies could be parsed; please check the format',
   '缺少 Authorization: Bearer <key>': 'Missing Authorization: Bearer <key>',
   'API key 无效': 'Invalid API key',
 };
 
-/* 含富文本的块：data-i18n="key" → 英文 innerHTML */
+/* Rich-text blocks: data-i18n="key" -> English innerHTML */
 const I18N_EN_HTML = {
   steps: '<b>Before you start, check two things:</b><br>\n'
     + '    1. You are logged in to <a href="https://muse.ai/" target="_blank"\n'
@@ -70,7 +72,7 @@ const I18N_EN_HTML = {
     + '    Nothing is collected or uploaded to any third-party server.',
 };
 
-/* 服务端返回的含变量文案：[正则, 替换串] */
+/* Server messages with variables: [regex, replacement] */
 const I18N_EN_PATTERNS = [
   [/^缺少核心 cookie：(.*)，该账号可能无法生成$/s, 'Missing core cookies: $1; this account may not be able to generate'],
 ];
@@ -87,8 +89,8 @@ function t(s, vars) {
 
 function applyLang() {
   $('langSel').value = LANG;
+  document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
   if (LANG !== 'en') return;
-  document.documentElement.lang = 'en';
   document.title = t(document.title);
   document.querySelectorAll('[data-i18n]').forEach((el) => {
     const html = I18N_EN_HTML[el.dataset.i18n];
@@ -108,7 +110,19 @@ function log(html, cls) {
   el.innerHTML = cls ? `<span class="${cls}">${html}</span>` : html;
 }
 
-/* 规范化服务地址：去掉结尾斜杠和 /v1 后缀 */
+/* Normalize the service URL: strip trailing slash and /v1 suffix */
+/* The service URL is user-supplied, so its origin is requested at runtime instead of
+ * asking for access to every website at install time. */
+async function ensureHostPermission(base) {
+  try {
+    const origin = new URL(base).origin + '/*';
+    if (await chrome.permissions.contains({ origins: [origin] })) return true;
+    return await chrome.permissions.request({ origins: [origin] });
+  } catch (e) {
+    return false;
+  }
+}
+
 function normBase(v) {
   let s = (v || '').trim();
   if (!s) return '';
@@ -124,7 +138,7 @@ async function loadCfg() {
   if (c.base) $('base').value = c.base;
   if (c.key) $('key').value = c.key;
   if (c.label) $('label').value = c.label;
-  // 没有配置过就尝试从当前标签页猜一个（用户在管理页上时）
+  // If unconfigured, try to guess from the current tab (when the user is on the admin page)
   if (!c.base) {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -134,7 +148,7 @@ async function loadCfg() {
         const k = new URLSearchParams(u.search).get('key');
         if (k) $('key').value = k;
       }
-    } catch (e) { /* 忽略 */ }
+    } catch (e) { /* ignore */ }
   }
 }
 
@@ -167,6 +181,11 @@ async function run() {
 
   if (!base) return log(t('请先填服务地址'), 'bad');
   if (!key) return log(t('请先填 API Key'), 'bad');
+
+  // Must run inside the click gesture, so keep it before the first awaited network call.
+  if (!(await ensureHostPermission(base))) {
+    return log(t('需要授权访问 {base} 才能导入。请再点一次，并在弹窗中选择允许。', { base }), 'bad');
+  }
 
   $('go').disabled = true;
   log(t('正在读取 muse.ai 的 Cookie…'));
