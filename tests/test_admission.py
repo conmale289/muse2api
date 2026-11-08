@@ -61,3 +61,13 @@ def test_both_endpoints_go_through_the_shared_helper():
     video_block = video_block.split('def get_video', 1)[0]
     assert '_admit_task("video"' in video_block
     assert "TASK_ADMISSION_LOCK" in video_block
+
+
+def test_admit_task_429_includes_rate_limit_headers(tasks):
+    tasks.tasks = {f"v{n}": {"kind": "video", "status": "queued"} for n in range(4)}
+    with pytest.raises(app.HTTPException) as exc:
+        app._admit_task("video", 4)
+    headers = exc.value.headers
+    assert headers["Retry-After"] == str(app._RATE_LIMIT_RETRY_AFTER_SECONDS)
+    assert headers["X-RateLimit-Limit-Requests"] == "4"
+    assert headers["X-RateLimit-Remaining-Requests"] == "0"
