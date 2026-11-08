@@ -2,22 +2,34 @@ version: '3.8'
 
 services:
   muse2api:
-    build: .
+    build:
+      context: .
+      args:
+        # Must match the owner of ./data on the host. On an existing install created by
+        # the old root image, run: sudo chown -R $(id -u):$(id -g) data
+        UID: ${MUSE2API_UID:-1000}
+        GID: ${MUSE2API_GID:-1000}
     image: muse2api:latest
     container_name: muse2api
     restart: always
     ports:
       - "18610:18610"
     environment:
-      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成）
+      # Admin and API authentication key (read from .env or the host environment; auto-generated when empty)
       - MUSE2API_KEY=${MUSE2API_KEY:-}
-      # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
+      # Public base URL for the service, e.g. https://your-domain.com (empty: the admin frontend detects the current origin)
       - MUSE2API_PUBLIC_BASE=
-      # 超时配置（秒）
+      # Timeout settings (seconds)
       - MUSE2API_IMAGE_TIMEOUT=240
       - MUSE2API_VIDEO_TIMEOUT=600
       - MUSE2API_CHAT_TIMEOUT=300
     volumes:
-      # 持久化账号配置、任务日志及媒体文件
+      # Persist account configuration, task logs, and media files
       - ./data:/app/data
-    shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
+    shm_size: '2gb' # Prevent Chromium from crashing on /dev/shm exhaustion when rendering multiple tabs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18610/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
