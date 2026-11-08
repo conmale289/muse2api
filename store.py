@@ -1,19 +1,25 @@
-"""账号池与任务存储（JSON 落盘，原子写）。"""
+"""Account pool and task storage (JSON on disk, atomic writes)."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
 import time
 import uuid
 
+from contextlib import contextmanager
+
 from proxy import public_proxy
+
+log = logging.getLogger("muse2api.store")
 
 _LOCK = threading.Lock()
 
-# 登录会话存在性检查；可用性仍须经上游认证（与 engine 一致）
-# hatch_vml 是可选工作区令牌，缺失不能据此拒绝会话导入
+# Login-session presence check only; availability still requires upstream auth
+# (same rule as engine). hatch_vml is an optional workspace token, so its absence
+# must not reject a session import.
 ESSENTIAL_COOKIES = ("hatch_sess",)
 
 
@@ -24,15 +30,18 @@ def _is_pos(v) -> bool:
         return False
 
 
-# hatch_vml 固定约 2 天，且不因使用而延长 —— 它就是决定账号寿命的那条 cookie。
-# 实测对照：生成前后 synced_at 变了、也捞到新 cookie，但 4 条核心 cookie 的
-# expires 一动不动。所以拿不到 hatch_vml 的 expires 时，按「导入时间 + 2 天」估算，
-# 而不是退回到 hatch_native_auth_device 的 30 天（那个不决定生死，会误导用户）。
+# hatch_vml lasts about two days and is not extended by use; it is the cookie that
+# determines account lifetime. Observed: synced_at changed and new cookies appeared
+# after generation, but the expires values of the four core cookies never moved.
+# If hatch_vml's expires is unavailable, estimate from import time + 2 days instead
+# of falling back to hatch_native_auth_device's 30 days (that value does not decide
+# lifetime and would mislead users).
 VML_TTL = 2 * 86400
 
 
 def min_expiry(cookies_exp: dict | None) -> int | None:
-    """核心 cookie 里最早过期的那个（通用兜底，不区分哪条决定寿命）。"""
+    """Earliest expiry among the core cookies (generic fallback; does not decide
+    which cookie determines lifetime)."""
     if not cookies_exp:
         return None
     vals = []
@@ -57,12 +66,12 @@ def min_expiry(cookies_exp: dict | None) -> int | None:
 
 def account_expiry(cookies_exp: dict | None,
                    base_ts: int | None = None) -> int | None:
-    """账号实际失效时间。
+    """Effective account expiry time.
 
-    优先级：
-      1) hatch_vml 的真实 expires（最准）；
-      2) 拿不到就用 base_ts(导入/同步时刻) + VML_TTL 估算 —— 因为寿命就是 2 天；
-      3) 都没有再退回核心 cookie 最早过期。
+    Priority:
+      1) hatch_vml's real expires value (most accurate);
+      2) otherwise estimate base_ts (import/sync time) + VML_TTL, since lifetime is 2 days;
+      3) otherwise fall back to the earliest core-cookie expiry.
     """
     ce = cookies_exp or {}
     vml = ce.get("hatch_vml")
@@ -73,14 +82,49 @@ def account_expiry(cookies_exp: dict | None,
     return min_expiry(ce)
 
 
-def _read(path: str, default):
+class StoreCorruptError(RuntimeError):
+    """A data file exists but cannot be parsed and could not be moved aside."""
+
+
+def _read(path: str, default, corrupt_files: list | None = None, expect=None):
+    """Load JSON, distinguishing "missing" from "unusable".
+
+    A missing file legitimately means "empty state". An unreadable one — bad JSON *or*
+    valid JSON of the wrong shape — must never be reported as empty: the next _write
+    would persist that empty state and destroy every account cookie or task record with
+    no way back. So move the bad file aside, log loudly, and record it for the admin
+    status endpoint. If it cannot even be moved aside, fail closed rather than proceed
+    towards overwriting it.
+    """
     if not os.path.isfile(path):
         return default
+    data = default
+    problem = ""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:  # noqa: BLE001
-        return default
+            data = json.load(f)
+        if expect is not None and not isinstance(data, expect):
+            problem = (f"expected {expect.__name__} at the top level, "
+                       f"got {type(data).__name__}")
+    except Exception as exc:  # noqa: BLE001
+        data = default
+        problem = str(exc)
+    if not problem:
+        return data
+
+    backup = f"{path}.corrupt-{int(time.time())}"
+    try:
+        os.replace(path, backup)
+    except OSError as move_exc:
+        raise StoreCorruptError(
+            f"{path} is unusable ({problem}) and could not be moved aside ({move_exc}); "
+            "repair or remove it before starting the service") from move_exc
+    log.error(
+        "Unusable data at %s (%s). Original preserved at %s; serving empty state. "
+        "Restore that file and restart to recover.", path, problem, backup)
+    if corrupt_files is not None:
+        corrupt_files.append({"path": path, "backup": backup, "error": problem})
+    return default
 
 
 def _write(path: str, obj):
@@ -99,14 +143,29 @@ def _write(path: str, obj):
 class Store:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.accounts: list[dict] = _read(cfg.accounts_file, [])
+        # Populated when a data file had to be quarantined; surfaced by /admin/status.
+        self.corrupt_files: list[dict] = []
+        self.accounts: list[dict] = _read(
+            cfg.accounts_file, [], self.corrupt_files, expect=list)
         for a in self.accounts:
             ce = a.get("cookies_exp") or {}
             if _is_pos(ce.get("hatch_vml")):
                 a["expires_at"] = int(ce["hatch_vml"])
-        self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+        self.tasks: dict[str, dict] = _read(
+            cfg.tasks_file, {}, self.corrupt_files, expect=dict)
+        # key hash -> task id, so idempotency lookup does not scan every task.
+        self._idem_index: dict[str, str] = {}
+        for tid, task in self.tasks.items():
+            key = task.get("image_request_key")
+            if key:
+                self._idem_index[key] = tid
+        # last_used/use_count are hot-path bookkeeping; flushing them on every pick meant
+        # rewriting every account's cookies for each request.
+        self._accounts_dirty = False
+        self._last_accounts_flush = time.monotonic()
+        self._defer_writes = False
 
-    # ---------- 账号 ----------
+    # ---------- Accounts ----------
     def add_account(self, cookies: dict, label: str = "",
                     cookies_exp: dict | None = None) -> dict:
         with _LOCK:
@@ -121,7 +180,7 @@ class Store:
                    "last_used": None, "last_keepalive": None, "use_count": 0,
                    "ok": None, "note": "", "synced_at": None}
             self.accounts.append(acc)
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts_locked(force=True)
             return acc
 
     @staticmethod
@@ -141,7 +200,7 @@ class Store:
             item["cookie_count"] = len(a.get("cookies", {}))
             item["essential_ok"] = all(
                 a.get("cookies", {}).get(n) for n in ESSENTIAL_COOKIES)
-            # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
+            # Whether expiry comes from hatch_vml's measured expires or a 2-day estimate.
             item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
             out.append(item)
         return out
@@ -150,15 +209,17 @@ class Store:
         with _LOCK:
             n = len(self.accounts)
             self.accounts = [a for a in self.accounts if a["id"] != aid]
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts_locked(force=True)
             return len(self.accounts) != n
 
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None,
                      exclude_ids: set[str] | list[str] | None = None,
                      record_use: bool = True) -> dict | None:
-        """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。
-        exclude_ids: 需要排除的账号 ID 集合（例如正在被其他并发线程占用的账号）。"""
+        """Select an available account. Prefer reusing the currently warmed healthy
+        account (to avoid reconnect cost); rotate after 15 sticky uses or on error.
+        exclude_ids: account IDs to exclude (for example accounts busy in other
+        concurrent threads)."""
         with _LOCK:
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
             if not live:
@@ -171,7 +232,8 @@ class Store:
                 if available:
                     live = available
                 elif exclude_ids is not None:
-                    # 并发模式下要求避开所有繁忙账号，但当前无剩余空闲账号
+                    # In concurrent mode every busy account must be avoided, but no
+                    # idle account remains.
                     return None
                 elif len(live) > 1:
                     live = [a for a in live if a["id"] != exclude_id] or live
@@ -183,9 +245,7 @@ class Store:
                             self._sticky_id = preferred_id
                             self._sticky_count = sticky_n + 1
                             if record_use:
-                                a["last_used"] = time.time()
-                                a["use_count"] = a.get("use_count", 0) + 1
-                                _write(self.cfg.accounts_file, self.accounts)
+                                self._record_use(a)
                             return a
             healthy = [a for a in live if a.get("ok") is not False]
             candidates = healthy if healthy else live
@@ -194,13 +254,61 @@ class Store:
             self._sticky_id = acc["id"]
             self._sticky_count = 1
             if record_use:
-                acc["last_used"] = time.time()
-                acc["use_count"] = acc.get("use_count", 0) + 1
-                _write(self.cfg.accounts_file, self.accounts)
+                self._record_use(acc)
             return acc
 
+    def _record_use(self, account: dict) -> None:
+        """Update LRU bookkeeping in memory and flush at most once a minute.
+
+        Writing accounts.json (every account's full cookie jar) on every pick dominated
+        per-request cost. The in-memory values are what pick_account sorts by, so only a
+        crash loses this bookkeeping, and only for the last minute.
+        """
+        account["last_used"] = time.time()
+        account["use_count"] = account.get("use_count", 0) + 1
+        self._accounts_dirty = True
+        now = time.monotonic()
+        if now - self._last_accounts_flush >= 60:
+            self._flush_accounts_locked()
+
+    def _save_accounts_locked(self, force: bool = False) -> None:
+        """Persist the account file unless a batch is in progress.
+
+        `force` is for structural changes (add/delete/import) that must be durable even
+        while a keepalive sweep is batching status updates.
+        """
+        self._accounts_dirty = True
+        if force or not self._defer_writes:
+            self._flush_accounts_locked()
+
+    def _flush_accounts_locked(self) -> None:
+        self._accounts_dirty = False
+        self._last_accounts_flush = time.monotonic()
+        _write(self.cfg.accounts_file, self.accounts)
+
+    @contextmanager
+    def batch_writes(self):
+        """Collapse the per-account writes of a sweep into a single flush."""
+        with _LOCK:
+            previous = self._defer_writes
+            self._defer_writes = True
+        try:
+            yield
+        finally:
+            with _LOCK:
+                self._defer_writes = previous
+                if not self._defer_writes and self._accounts_dirty:
+                    self._flush_accounts_locked()
+
+    def flush(self) -> None:
+        """Persist deferred bookkeeping (called on shutdown)."""
+        with _LOCK:
+            if self._accounts_dirty:
+                self._flush_accounts_locked()
+
     def touch_keepalive(self, aid: str, ok: bool | None = True, note: str = ""):
-        """ok=None 仅记录未确认的检测；保留上次账号状态、成功保活时间和有效期。"""
+        """ok=None records an unconfirmed check only; keeps the previous account
+        status, successful keepalive time, and expiry."""
         with _LOCK:
             now_ts = int(time.time())
             for a in self.accounts:
@@ -209,13 +317,14 @@ class Store:
                         a["ok"] = ok
                     if ok is True:
                         a["last_keepalive"] = now_ts
-                        # ponytail: 只信实际 Cookie 到期时间或原导入锚点，不凭检测成功虚推 48h。
+                        # Only trust the real cookie expiry or the original import
+                        # anchor; never inflate 48h based on a successful check.
                         a["expires_at"] = account_expiry(
                             a.get("cookies_exp"), a.get("expiry_anchor") or a.get("created_at"))
                     if note:
                         a["note"] = note[:300]
                     a["checked_at"] = now_ts
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts_locked()
 
     def mark(self, aid: str, ok: bool, note: str = ""):
         with _LOCK:
@@ -224,7 +333,7 @@ class Store:
                     a["ok"] = ok
                     a["note"] = note[:300]
                     a["checked_at"] = int(time.time())
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts_locked()
 
     def get_account(self, aid: str) -> dict | None:
         for a in self.accounts:
@@ -233,13 +342,14 @@ class Store:
         return None
 
     def update_account(self, aid: str, **kw) -> dict | None:
-        """更新标签 / 启用状态 / cookies / 有效期等；值为 None 的字段跳过。
+        """Update label / enabled state / cookies / expiry, etc. None values are skipped.
 
-        传了 cookies_exp 会自动重算 expires_at，不用调用方自己算。
-        估算锚点 expiry_anchor 的维护规则（避免有效期被反复虚推）：
-          - 读到了 hatch_vml 的真实 expires  -> 清空锚点，直接用真值；
-          - 读不到且锚点为空                -> 把锚点钉在当下（只钉一次）；
-          - 补入全新会话 cookie（重登）      -> 调用方显式传 expiry_anchor=now 重置。
+        Passing cookies_exp automatically recalculates expires_at, so callers do not
+        need to compute it. Maintenance rules for the expiry_anchor estimate (to
+        avoid repeatedly inflating expiry):
+          - real hatch_vml expires read        -> clear the anchor and use the real value;
+          - unavailable and anchor is empty    -> pin the anchor to now (once);
+          - brand-new session cookie (re-login) -> caller explicitly passes expiry_anchor=now.
         """
         with _LOCK:
             for a in self.accounts:
@@ -255,7 +365,7 @@ class Store:
                             a["expiry_anchor"] = int(time.time())
                         a["expires_at"] = account_expiry(
                             ce, a.get("expiry_anchor") or a.get("created_at"))
-                    _write(self.cfg.accounts_file, self.accounts)
+                    self._save_accounts_locked()
                     return a
         return None
 
@@ -278,7 +388,7 @@ class Store:
                 "healthy": healthy, "error": bad,
                 "expiring": expiring, "expired": expired}
 
-    # ---------- 任务 ----------
+    # ---------- Tasks ----------
     def create_task(self, kind: str, prompt: str) -> dict:
         with _LOCK:
             tid = "task_" + uuid.uuid4().hex[:20]
@@ -286,6 +396,7 @@ class Store:
                  "status": "queued", "created_at": int(time.time()),
                  "updated_at": int(time.time()), "result": None, "error": None}
             self.tasks[tid] = t
+            self._prune_tasks_locked()
             _write(self.cfg.tasks_file, self.tasks)
             return t
 
@@ -296,8 +407,41 @@ class Store:
                 return None
             t.update(kw)
             t["updated_at"] = int(time.time())
+            key = kw.get("image_request_key")
+            if key:
+                self._idem_index[key] = tid
+            if kw.get("status") in ("completed", "failed"):
+                self._prune_tasks_locked()
             _write(self.cfg.tasks_file, self.tasks)
             return t
+
+    def find_task_by_idempotency(self, key_hash: str) -> dict | None:
+        """Look up a task by its Idempotency-Key hash without scanning every task."""
+        with _LOCK:
+            tid = self._idem_index.get(key_hash)
+            if not tid:
+                return None
+            task = self.tasks.get(tid)
+            if task is None:
+                self._idem_index.pop(key_hash, None)
+            return task
+
+    def _prune_tasks_locked(self) -> None:
+        """Keep at most cfg.task_retention tasks, dropping the oldest finished ones.
+
+        Queued/processing tasks are never pruned: dropping one would orphan a running
+        worker that still reports progress to that id.
+        """
+        keep = getattr(self.cfg, "task_retention", 0) or 0
+        excess = len(self.tasks) - keep if keep > 0 else 0
+        if excess <= 0:
+            return
+        terminal = [(tid, task) for tid, task in self.tasks.items()
+                    if task.get("status") in ("completed", "failed")]
+        terminal.sort(key=lambda item: item[1].get("created_at") or 0)
+        for tid, task in terminal[:excess]:
+            self.tasks.pop(tid, None)
+            self._forget_idempotency(task)
 
     def get_task(self, tid: str) -> dict | None:
         return self.tasks.get(tid)
@@ -309,11 +453,12 @@ class Store:
 
     def delete_task(self, tid: str) -> bool:
         with _LOCK:
-            if tid in self.tasks:
-                del self.tasks[tid]
-                _write(self.cfg.tasks_file, self.tasks)
-                return True
-            return False
+            task = self.tasks.pop(tid, None)
+            if task is None:
+                return False
+            self._forget_idempotency(task)
+            _write(self.cfg.tasks_file, self.tasks)
+            return True
 
     def clear_tasks(self, keep: int = 0) -> int:
         with _LOCK:
@@ -321,6 +466,12 @@ class Store:
                            key=lambda t: t.get("created_at") or 0, reverse=True)
             keep_ids = {t["id"] for t in items[:keep]}
             removed = len(self.tasks) - len(keep_ids)
-            self.tasks = {k: v for k, v in self.tasks.items() if k in keep_ids}
+            for tid in [t for t in self.tasks if t not in keep_ids]:
+                self._forget_idempotency(self.tasks.pop(tid))
             _write(self.cfg.tasks_file, self.tasks)
             return max(0, removed)
+
+    def _forget_idempotency(self, task: dict | None) -> None:
+        key = (task or {}).get("image_request_key")
+        if key and self._idem_index.get(key) == (task or {}).get("id"):
+            self._idem_index.pop(key, None)
