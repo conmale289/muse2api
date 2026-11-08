@@ -1,4 +1,4 @@
-"""muse2api 配置。"""
+"""muse2api configuration."""
 from __future__ import annotations
 
 import os
@@ -9,7 +9,8 @@ _DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _load_dotenv():
-    """自动加载项目根目录下的 .env 文件（不覆盖已存在的系统环境变量）。"""
+    """Load the project-root .env file automatically (does not override existing
+    system environment variables)."""
     base = os.environ.get("MUSE2API_HOME") or _DEFAULT_BASE_DIR
     env_path = os.path.join(base, ".env")
     if not os.path.isfile(env_path):
@@ -37,7 +38,8 @@ def _env(key: str, default: str) -> str:
 
 
 def _detect_chromium() -> str:
-    """优先使用 MUSE2API_CHROMIUM；若未设置或路径不存在，则自动探测系统已安装的 Chromium/Chrome。"""
+    """Prefer MUSE2API_CHROMIUM; if unset or missing, auto-detect an installed
+    Chromium/Chrome."""
     configured = os.environ.get("MUSE2API_CHROMIUM", "").strip()
     if configured and (os.path.isfile(configured) or shutil.which(configured)):
         return configured
@@ -68,7 +70,7 @@ class Config:
     host: str = field(default_factory=lambda: _env("MUSE2API_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(_env("MUSE2API_PORT", "18610")))
 
-    # 浏览器
+    # Browser section
     chromium: str = field(default_factory=_detect_chromium)
     cdp_port: int = field(default_factory=lambda: int(_env("MUSE2API_CDP_PORT", "19210")))
     home_dir: str = field(default_factory=lambda: _env("MUSE2API_HOME_DIR", os.path.expanduser("~")))
@@ -76,54 +78,110 @@ class Config:
     site_url: str = field(default_factory=lambda: _env("MUSE2API_SITE", "https://muse.ai/"))
     login_wait: int = field(default_factory=lambda: int(_env("MUSE2API_LOGIN_WAIT", "60")))
 
-    # 浏览器 profile 根目录。
-    # 踩过的坑：snap 版 chromium 受 AppArmor 约束，只能读写 $HOME 下的路径。
-    # 传 --user-data-dir=/opt/... 或 /tmp/... 不会报错，但会被静默忽略，
-    # 浏览器回落到 ~/snap/chromium/common/chromium。
-    # 所以必须落在 $HOME 下（不要用点开头的隐藏目录，snap 的 home 接口排除隐藏文件）。
+    # Browser profile root.
+    # Pitfall: snap-packaged Chromium is confined by AppArmor and can only read/write
+    # paths under $HOME. Passing --user-data-dir=/opt/... or /tmp/... does not fail,
+    # but is silently ignored and the browser falls back to
+    # ~/snap/chromium/common/chromium. The path must therefore stay under $HOME
+    # (avoid dot-prefixed hidden directories; snap's home interface excludes them).
     profile_root: str = field(
         default_factory=lambda: _env("MUSE2API_PROFILE_ROOT",
                                      os.path.join(os.path.expanduser("~"),
                                                   "muse2api-profiles")))
 
-    # 鉴权
+    # Authentication
     api_key: str = field(default_factory=lambda: _env("MUSE2API_KEY", ""))
+    # Separate credential for code-changing admin actions (/admin/update/upgrade and
+    # /admin/repo/push). The inference key is handed to every downstream client, so it
+    # must not be able to publish code. Empty means "fall back to api_key" for upgrade,
+    # and "push is disabled" for /admin/repo/push.
+    maintainer_key: str = field(
+        default_factory=lambda: _env("MUSE2API_MAINTAINER_KEY", ""))
 
-    # 对外地址（管理页面显示「接入地址」用；留空则页面用当前域名兜底）
+    # Public base URL (shown as the "endpoint" in the admin page; when empty the
+    # page falls back to the current origin)
     public_base: str = field(
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))
 
-    # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
+    # Origins allowed to call the import endpoint cross-origin (used when the
+    # cookie helper is submitted from a muse.ai page)
     cors_origins: str = field(
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
                                      "https://muse.ai,https://www.muse.ai"))
 
-    # 生成
+    # Generation
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
-    max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "2"))))
+    # How many generation/chat tasks may run at once. They share ONE Chromium process
+    # and one CDP connection, each on its own tab (thread-local page), so this is
+    # concurrent tab work, not concurrent browsers.
+    #
+    # Default 1: the browser is a single shared resource, so serialising by default is
+    # the honest setting. Raising it lets several tabs interleave and can help when
+    # requests spend most of their time waiting on Muse, but it adds contention on the
+    # shared CDP connection rather than adding browsers. Measure before raising it.
+    max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "1"))))
 
-    # 参考图输入默认只允许调用方直接提供数据和公网 URL。
-    # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。
+    # Admission caps: how many tasks of each kind may be queued or processing at once.
+    # Both paths are capped — video used to be unbounded, which let N requests spawn N
+    # threads and N task records while the browser could only drain one at a time.
+    image_queue_max: int = field(
+        default_factory=lambda: max(1, int(_env("MUSE2API_IMAGE_QUEUE_MAX", "8"))))
+    video_queue_max: int = field(
+        default_factory=lambda: max(1, int(_env("MUSE2API_VIDEO_QUEUE_MAX", "4"))))
+
+    # Chat/responses have no persisted task row like image/video do, so this bounds
+    # in-flight /v1/chat/completions + /v1/responses requests directly (counted for the
+    # full request duration, including streaming) rather than a store.tasks scan.
+    # Each request is lighter than an image/video generation (no file I/O, no task
+    # polling) but still holds one account lease and a worker thread for up to
+    # MUSE2API_CHAT_TIMEOUT, so a higher default than image/video is reasonable.
+    chat_queue_max: int = field(
+        default_factory=lambda: max(1, int(_env("MUSE2API_CHAT_QUEUE_MAX", "16"))))
+
+    # Keep at most this many finished task records (0 disables pruning). Each task write
+    # rewrites the whole file, so unbounded history makes every update slower.
+    task_retention: int = field(
+        default_factory=lambda: max(0, int(_env("MUSE2API_TASK_RETENTION", "200"))))
+
+    # Delete generated media older than this many days (0 = keep forever). Files that a
+    # queued/processing task still references are never deleted.
+    media_retention_days: int = field(
+        default_factory=lambda: max(0, int(_env("MUSE2API_MEDIA_RETENTION_DAYS", "0"))))
+
+    # Reference-media input defaults to caller-supplied data and public URLs only.
+    # Only trusted single-user deployments should explicitly set these to 1 to
+    # restore server-local files or private-network fetching.
     ref_image_local_files: bool = field(
         default_factory=lambda: _env("MUSE2API_REF_IMAGE_LOCAL_FILES", "0").strip() == "1")
     ref_image_private_fetch: bool = field(
         default_factory=lambda: _env("MUSE2API_REF_IMAGE_PRIVATE_FETCH", "0").strip() == "1")
 
-    # 工具调用（function calling）协议适配开关，**默认关闭**。
-    # 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"（原话：「我不会按这种 JSON
-    # 格式输出'伪工具调用'」），强行注入协议反而会污染正常回答。
-    # 所以默认只做「参数兼容」（客户端传 tools 不会 422），不注入、不解析。
-    # 若目标模型行为有变，可设 MUSE2API_TOOL_PROTOCOL=1 打开这层适配再试。
+    # Tool-calling (function calling) protocol adapter, disabled by default.
+    # Observed: the muse.ai assistant explicitly refuses to emit "pseudo tool calls"
+    # (verbatim: "I won't output 'pseudo tool calls' in this JSON format"), and
+    # forcing the protocol pollutes normal answers. The default therefore only keeps
+    # "parameter compatibility" (a client sending tools does not get a 422); nothing
+    # is injected or parsed. If upstream behavior changes, set
+    # MUSE2API_TOOL_PROTOCOL=1 to enable this adapter and retry.
     tool_protocol: bool = field(
         default_factory=lambda: _env("MUSE2API_TOOL_PROTOCOL", "0").strip() != "0")
 
-    # 保活设置：是否对已禁用的账号执行自动保活，**默认关闭**。
-    # 开启后，被管理员在后台手动禁用的账号仍会由后台守护进程执行自动保活与 VM 唤醒，
-    # 保持会话活性不失效，但依然不会参与正常业务生图、生视频与对话轮转调度。
+    # Keepalive: whether to run automatic keepalive for disabled accounts
+    # (disabled by default). When enabled, accounts manually disabled in the admin
+    # console still get background keepalive and VM wake-ups, preserving session
+    # liveness, but they never join normal image/video/chat rotation.
     keepalive_disabled_accounts: bool = field(
         default_factory=lambda: _env("MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS", "0").strip() != "0")
+
+    # Background Chromium health check always runs (piggybacked on the keepalive
+    # loop's ~15-minute tick) and recycles a crashed or CDP-unresponsive browser.
+    # This field adds an *optional* extra trigger: proactively recycle on uptime
+    # alone, even if currently healthy. 0 (default) disables it -- only genuinely
+    # unhealthy browsers get recycled out of the box.
+    browser_max_uptime_hours: float = field(
+        default_factory=lambda: max(0.0, float(_env("MUSE2API_BROWSER_MAX_UPTIME_HOURS", "0"))))
 
     @property
     def data_dir(self) -> str:
@@ -139,7 +197,7 @@ class Config:
 
     @property
     def profile_dir(self) -> str:
-        """生成用浏览器 profile。"""
+        """Browser profile used for generation."""
         return os.path.join(self.profile_root, "generate")
 
     @property
