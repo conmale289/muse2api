@@ -370,9 +370,9 @@
       <div class="tblwrap"><table>
         <thead><tr>
           <th>标签</th><th>账号 ID</th><th>状态</th><th>有效期</th><th>额度</th><th data-i18n="col-enabled">启用</th><th>Cookie</th>
-          <th>最后使用</th><th>备注</th><th style="min-width:250px">操作</th>
+          <th>最后使用</th><th>调用次数</th><th>备注</th><th style="min-width:250px">操作</th>
         </tr></thead>
-        <tbody id="poolBody"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
+        <tbody id="poolBody"><tr><td colspan="11" class="empty">加载中…</td></tr></tbody>
       </table></div>
     </div>
   </section>
@@ -991,6 +991,7 @@ const I18N_EN = {
   "额度": "Quota",
   "启用": "Enable",
   "最后使用": "Last used",
+  "调用次数": "Use count",
   "备注": "Notes",
   "操作": "Actions",
   "加载中…": "Loading…",
@@ -1833,7 +1834,7 @@ async function loadPool(){
     }
 
     if (!accounts.length){
-      $('poolBody').innerHTML = '<tr><td colspan="10" class="empty">还没有账号。去「获取 Cookie」页签按三步导入一个</td></tr>';
+      $('poolBody').innerHTML = '<tr><td colspan="11" class="empty">还没有账号。去「获取 Cookie」页签按三步导入一个</td></tr>';
       return;
     }
     $('poolBody').innerHTML = accounts.map(a => {
@@ -1852,6 +1853,7 @@ async function loadPool(){
         <td>${a.enabled ? '<span class="badge ok">开</span>' : '<span class="badge mute">关</span>'}</td>
         <td class="mono">${a.cookie_count}</td>
         <td class="mono" title="${a.last_used ? fmtTime(a.last_used) : ''}">${ago(a.last_used)}</td>
+        <td class="mono">${a.use_count ?? 0}</td>
         <td class="mono ellip" title="${esc(a.note||'')}">${esc(a.note || '—')}</td>
         <td><div class="acts">
           <button class="ghost mini" onclick="testAcc('${a.id}')">测试</button>
@@ -1867,8 +1869,8 @@ async function loadPool(){
     }).join('');
   }catch(e){
     $('poolBody').innerHTML = authOK === false
-      ? '<tr><td colspan="10" class="empty">🔑 请先在右上角填入 API Key 并点「保存」</td></tr>'
-      : `<tr><td colspan="10" class="empty">加载失败：${esc(e.message)}</td></tr>`;
+      ? '<tr><td colspan="11" class="empty">🔑 请先在右上角填入 API Key 并点「保存」</td></tr>'
+      : `<tr><td colspan="11" class="empty">加载失败：${esc(e.message)}</td></tr>`;
   }
 }
 

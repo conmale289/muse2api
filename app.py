@@ -223,6 +223,9 @@ TASK_ADMISSION_LOCK = IMAGE_TASK_LOCK
 # Chat/responses have no persisted task row; count in-flight requests directly.
 # Guarded by TASK_ADMISSION_LOCK, same mutex image/video admission already shares.
 _CHAT_ACTIVE = 0
+# Observability only -- process-local, reset on restart, not a durable audit trail.
+_CHAT_REJECTED = 0
+_TASK_REJECTED: dict[str, int] = {"image": 0, "video": 0}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -285,6 +288,12 @@ def _err_type(status: int) -> str:
 
 @app.exception_handler(HTTPException)
 async def _http_exc(request: Request, exc: HTTPException):
+    if exc.status_code in (401, 429):
+        log.warning("%s %s -> %d: %s", request.method, request.url.path,
+                   exc.status_code, exc.detail)
+    elif exc.status_code >= 500:
+        log.error("%s %s -> %d: %s", request.method, request.url.path,
+                  exc.status_code, exc.detail)
     if request.url.path.startswith("/v1/"):
         return JSONResponse(
             status_code=exc.status_code,
@@ -648,8 +657,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
             if kind == "data":
                 yield val
             elif kind == "error":
+                _note_generation_result(val)
                 raise val
             else:
+                _note_generation_result(None)
                 break
     finally:
         stop_event.set()
@@ -1406,6 +1417,37 @@ def _pos(v) -> bool:
         return False
 
 
+_CONSECUTIVE_GEN_FAILURES = 0
+_GEN_FAILURE_LOCK = threading.Lock()
+
+
+def _note_generation_result(exc: Exception | None) -> None:
+    """Track consecutive wedged-page-style failures across every image/video/chat
+    request, independent of which account was used.
+
+    is_healthy() only pings the browser-process-level /json/version endpoint, so a
+    single hung renderer/page behind an otherwise-healthy browser process is invisible
+    to it. This counter fills that gap and feeds _browser_health_check_sync's third
+    recycle trigger. Only a plain MuseGenerationError (timeout, deadline-exceeded,
+    browser-queue-timeout, etc.) counts as a failure signal:
+      - MuseAuthError / MuseProxyError: an account or network problem, not a wedged
+        page -- the browser itself may be perfectly healthy.
+      - MuseModelRefusalError / RefImageSafetyError: an expected content/input
+        outcome, not an engine problem.
+    Any success (exc=None) resets the streak to 0. Called from exactly two places --
+    _run_generation's outer try/except (image/video) and safe_chat_stream's consumer
+    loop (chat/responses) -- the single funnel every caller of each already routes
+    through, so no other call site ever needs to call this directly.
+    """
+    global _CONSECUTIVE_GEN_FAILURES
+    with _GEN_FAILURE_LOCK:
+        if exc is None:
+            _CONSECUTIVE_GEN_FAILURES = 0
+        elif isinstance(exc, MuseGenerationError) and not isinstance(
+                exc, (MuseProxyError, MuseModelRefusalError, RefImageSafetyError)):
+            _CONSECUTIVE_GEN_FAILURES += 1
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
@@ -1419,9 +1461,15 @@ def _run_generation(prompt: str, kind: str, timeout: int,
     chat request that holds an account and is waiting for the browser.
     """
     deadline = time.monotonic() + max(1, timeout)
-    return _run_generation_locked(prompt, kind, timeout, account_id,
-                                  on_progress, reference_image, reference_images,
-                                  deadline=deadline, on_acquired=on_acquired)
+    try:
+        result = _run_generation_locked(prompt, kind, timeout, account_id,
+                                        on_progress, reference_image, reference_images,
+                                        deadline=deadline, on_acquired=on_acquired)
+    except Exception as exc:
+        _note_generation_result(exc)
+        raise
+    _note_generation_result(None)
+    return result
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
@@ -1543,7 +1591,7 @@ def readyz():
     accs = [a for a in store.list_accounts() if a.get("enabled", True)]
     return {"status": "ready" if accs else "no_account",
             "accounts": len(accs),
-            "browser_running": bool(engine.proc and engine.proc.poll() is None)}
+            "browser_running": engine.is_healthy()[0]}
 
 
 @app.get("/v1/models")
@@ -1615,6 +1663,25 @@ def _prepare_reference_images(images: list[str]) -> list[str]:
     return prepared
 
 
+_RATE_LIMIT_RETRY_AFTER_SECONDS = 5
+
+
+def _rate_limit_headers(limit: int, active: int) -> dict:
+    """OpenAI-SDK-compatible headers on a 429 so client-side backoff logic engages.
+
+    This is a concurrency admission cap, not a token-bucket time window, so there is
+    no true "reset" instant to report -- X-RateLimit-Reset-Requests is intentionally
+    omitted rather than invented. Retry-After is a fixed advisory delay for the same
+    reason: this counter-based cap cannot compute a deterministic next-free-slot time
+    the way a token bucket can.
+    """
+    return {
+        "Retry-After": str(_RATE_LIMIT_RETRY_AFTER_SECONDS),
+        "X-RateLimit-Limit-Requests": str(limit),
+        "X-RateLimit-Remaining-Requests": str(max(0, limit - active)),
+    }
+
+
 def _admit_task(kind: str, limit: int) -> None:
     """Refuse a new task when too many of this kind are already queued or processing.
 
@@ -1625,8 +1692,10 @@ def _admit_task(kind: str, limit: int) -> None:
                  if task.get("kind") == kind
                  and task.get("status") in ("queued", "processing"))
     if active >= limit:
+        _TASK_REJECTED[kind] = _TASK_REJECTED.get(kind, 0) + 1
         raise HTTPException(
-            429, f"{kind.capitalize()} queue is full ({limit} active); retry later")
+            429, f"{kind.capitalize()} queue is full ({limit} active); retry later",
+            headers=_rate_limit_headers(limit, active))
 
 
 def _admit_chat() -> None:
@@ -1639,11 +1708,13 @@ def _admit_chat() -> None:
     slot is always freed -- on success, on any exception, and on client disconnect
     (GeneratorExit during streaming).
     """
-    global _CHAT_ACTIVE
+    global _CHAT_ACTIVE, _CHAT_REJECTED
     with TASK_ADMISSION_LOCK:
         if _CHAT_ACTIVE >= CFG.chat_queue_max:
+            _CHAT_REJECTED += 1
             raise HTTPException(
-                429, f"Chat queue is full ({CFG.chat_queue_max} active); retry later")
+                429, f"Chat queue is full ({CFG.chat_queue_max} active); retry later",
+                headers=_rate_limit_headers(CFG.chat_queue_max, _CHAT_ACTIVE))
         _CHAT_ACTIVE += 1
 
 
@@ -2463,18 +2534,61 @@ def admin_status(_=Depends(auth)):
         "tasks": store.list_tasks(20),
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
-        "browser_running": bool(engine.proc and engine.proc.poll() is None),
+        "browser_running": engine.is_healthy()[0],
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
         # Non-empty when a data file had to be quarantined at startup; the original is
         # preserved at the reported backup path.
         "corrupt_files": list(store.corrupt_files),
+        "observability": {
+            "chat_rejected": _CHAT_REJECTED,
+            "task_rejected": dict(_TASK_REJECTED),
+            "consecutive_generation_failures": _CONSECUTIVE_GEN_FAILURES,
+            "recycle_count": _RECYCLE_COUNT,
+            "last_recycle_reason": _LAST_RECYCLE_REASON,
+            "last_recycle_at": _LAST_RECYCLE_AT or None,
+        },
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }
+
+
+@app.get("/metrics")
+def metrics(_=Depends(auth)):
+    """Hand-written Prometheus text exposition (stdlib only; no prometheus_client
+    dependency -- requirements.txt stays minimal). Gated by the same API key as
+    every /admin/* route; Prometheus scrape configs support a bearer token, so this
+    does not require an unauthenticated surface."""
+    stats = store.stats()
+    lines = [
+        "# HELP muse2api_chat_rejected_total Chat/responses admission rejections (HTTP 429) since process start.",
+        "# TYPE muse2api_chat_rejected_total counter",
+        f"muse2api_chat_rejected_total {_CHAT_REJECTED}",
+        "",
+        "# HELP muse2api_task_rejected_total Image/video admission rejections (HTTP 429) since process start, by kind.",
+        "# TYPE muse2api_task_rejected_total counter",
+    ]
+    for kind, count in sorted(_TASK_REJECTED.items()):
+        lines.append(f'muse2api_task_rejected_total{{kind="{kind}"}} {count}')
+    lines += [
+        "",
+        "# HELP muse2api_browser_recycle_total Proactive Chromium recycles since process start.",
+        "# TYPE muse2api_browser_recycle_total counter",
+        f"muse2api_browser_recycle_total {_RECYCLE_COUNT}",
+        "",
+        "# HELP muse2api_consecutive_generation_failures Current consecutive generation-failure streak (resets to 0 on any success).",
+        "# TYPE muse2api_consecutive_generation_failures gauge",
+        f"muse2api_consecutive_generation_failures {_CONSECUTIVE_GEN_FAILURES}",
+        "",
+        "# HELP muse2api_accounts Account pool counts by status.",
+        "# TYPE muse2api_accounts gauge",
+    ]
+    for key in ("total", "enabled", "disabled", "healthy", "error", "expiring", "expired"):
+        lines.append(f'muse2api_accounts{{status="{key}"}} {stats.get(key, 0)}')
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 # ------------------------- Admin: account pool -------------------------
@@ -3175,6 +3289,12 @@ def _warmup_browser_sync():
         GEN_LOCK.release()
 
 
+# Observability only -- process-local, reset on restart, not a durable audit trail.
+_RECYCLE_COUNT = 0
+_LAST_RECYCLE_REASON: str | None = None
+_LAST_RECYCLE_AT: float = 0.0
+
+
 def _browser_health_check_sync() -> dict:
     """Detect a crashed or unresponsive shared Chromium and proactively recycle it.
 
@@ -3184,8 +3304,14 @@ def _browser_health_check_sync() -> dict:
     non-blocking acquire here proves no generation is in flight. If GEN_LOCK is held,
     this cycle is skipped and retried on the next tick.
     """
+    global _RECYCLE_COUNT, _LAST_RECYCLE_REASON, _LAST_RECYCLE_AT
     healthy, detail = engine.is_healthy()
     reason = None if healthy else f"unhealthy: {detail}"
+    consecutive_trigger = False
+    if reason is None and CFG.browser_max_consecutive_failures > 0:
+        if _CONSECUTIVE_GEN_FAILURES >= CFG.browser_max_consecutive_failures:
+            reason = f"{_CONSECUTIVE_GEN_FAILURES} consecutive generation failures"
+            consecutive_trigger = True
     if reason is None and CFG.browser_max_uptime_hours > 0:
         if engine.uptime_seconds > CFG.browser_max_uptime_hours * 3600:
             reason = f"max uptime exceeded ({CFG.browser_max_uptime_hours}h)"
@@ -3196,6 +3322,11 @@ def _browser_health_check_sync() -> dict:
         return {"recycled": False, "deferred": True, "reason": reason}
     try:
         engine.recycle(reason)
+        _RECYCLE_COUNT += 1
+        _LAST_RECYCLE_REASON = reason
+        _LAST_RECYCLE_AT = time.time()
+        if consecutive_trigger:
+            _note_generation_result(None)  # fresh browser; stale failure history must not re-trigger immediately
         return {"recycled": True, "reason": reason}
     finally:
         GEN_LOCK.release()

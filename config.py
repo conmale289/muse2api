@@ -183,6 +183,16 @@ class Config:
     browser_max_uptime_hours: float = field(
         default_factory=lambda: max(0.0, float(_env("MUSE2API_BROWSER_MAX_UPTIME_HOURS", "0"))))
 
+    # Detects a "wedged page" that is_healthy() cannot see on its own: is_healthy()
+    # only pings the browser-process-level /json/version endpoint, so a single hung
+    # renderer/page behind an otherwise-healthy browser process is invisible to it.
+    # This counts consecutive generation failures across every image/video/chat
+    # request (reset to 0 on any success) and adds a third recycle trigger once the
+    # streak reaches this threshold. 0 disables only this trigger -- crash/CDP-
+    # unresponsive detection and, if configured, uptime-based recycling still run.
+    browser_max_consecutive_failures: int = field(
+        default_factory=lambda: max(0, int(_env("MUSE2API_BROWSER_MAX_CONSECUTIVE_FAILURES", "5"))))
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")

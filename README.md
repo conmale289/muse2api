@@ -466,6 +466,7 @@ For Nginx reverse proxies, raise `client_max_body_size` to about 200M, otherwise
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | Server-local paths are disabled by default; only trusted single-user deployments should set `1` to restore |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | Only public URLs are allowed by default, with per-hop DNS/redirect checks, pinned checked IPs, and no environment proxy; set `1` explicitly to allow private/local URLs |
 | `MUSE2API_BROWSER_MAX_UPTIME_HOURS` | `0` | Proactively recycle the shared Chromium after this many hours of uptime, even if healthy (`0` disables); crash/unresponsive detection always runs regardless |
+| `MUSE2API_BROWSER_MAX_CONSECUTIVE_FAILURES` | `5` | Proactively recycle the shared Chromium after this many consecutive plain generation failures across image/video/chat (`0` disables this trigger only); detects a wedged page/renderer that the crash/CDP-unresponsive check cannot see on its own |
 
 Both switches default to `0`: all image generation, image editing, image tasks, and video endpoints reject server-local paths and private/local URLs. Data URLs, valid Base64, and public URLs work normally. Set them to `1` only when the caller is confirmed trusted and the capability is genuinely needed.
 Policy rejection, download failure, and MIME or size violations return HTTP 400 before the task is submitted, so no background task is created and then failed later.
@@ -475,6 +476,10 @@ Reference-image security regression check (simulated DNS and HTTP; no real netwo
 ```bash
 python tests/test_ref_image_safety.py
 ```
+
+### Monitoring
+
+`GET /metrics` returns Prometheus text exposition, gated by the same `Authorization: Bearer <MUSE2API_KEY>` header as other endpoints; a Prometheus scrape config needs an `authorization: {credentials: <key>}` (or equivalent `bearer_token`) entry for this target.
 
 ---
 
