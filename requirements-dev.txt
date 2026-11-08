@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test runner. Pinned to a compatible pair: pytest-asyncio >= 0.24 requires pytest >= 8.2,
+# and mixing a newer pytest-asyncio with an older pytest fails at plugin import
+# ("cannot import name 'FixtureDef' from 'pytest'").
+pytest>=8.2,<9
+pytest-asyncio>=0.24,<1

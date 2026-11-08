@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Syntax and static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Byte-compile Python
+        run: python -m compileall -q app.py engine.py store.py config.py cdp.py proxy.py tools tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: JavaScript syntax and admin message test
+        run: |
+          node --check extension/popup.js
+          node tests/test_admin_api_error_messages.mjs
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run pytest
+        run: pytest -q
+
+  browser:
+    name: Browser regressions (non-blocking)
+    runs-on: ubuntu-latest
+    # These drive a real Chromium and are timing sensitive on shared runners. They are
+    # reported but do not gate a merge; run them locally before a release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+      - name: Run browser scripts
+        env:
+          MUSE2API_CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          python tests/test_admin_layout.py
+          python tests/test_media_selection.py
+          python tests/test_reference_upload_browser.py
